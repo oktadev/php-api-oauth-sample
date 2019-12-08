@@ -50,5 +50,48 @@ if (! $routeFound) {
 
 $methodName = $route['controller_method'];
 
+// authenticate the request:
+if (! authenticate($methodName)) {
+    header("HTTP/1.1 401 Unauthorized");
+    exit('Unauthorized');
+}
+
 $controller = new CustomerController();
 $controller->$methodName($uriParts);
+
+// END OF FRONT CONTROLLER
+// OAuth authentication functions follow
+
+function authenticate($methodName)
+{
+    if (! isset($_SERVER['HTTP_AUTHORIZATION'])) {
+        return false;
+    }
+
+    $authHeader = $_SERVER['HTTP_AUTHORIZATION'];
+    preg_match('/Bearer\s(\S+)/', $authHeader, $matches);
+
+    if(! isset($matches[1])) {
+        return false;
+    }
+
+    $token = $matches[1];
+
+    if ($methodName == 'charge') {
+        return authenticateRemotely($token);
+    } else {
+        return authenticateLocally($token);
+    }
+}
+
+function authenticateRemotely($token)
+{
+    echo "remote";
+    return false;
+}
+
+function authenticateLocally()
+{
+    echo "local";
+    return false;
+}
