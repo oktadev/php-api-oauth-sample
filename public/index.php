@@ -64,6 +64,7 @@ $controller->$methodName($uriParts);
 
 function authenticate($methodName)
 {
+    // extract the token from the headers
     if (! isset($_SERVER['HTTP_AUTHORIZATION'])) {
         return false;
     }
@@ -77,21 +78,171 @@ function authenticate($methodName)
 
     $token = $matches[1];
 
+    // decode the token
+    $tokenParts = explode('.', $token);
+    $decodedToken['header'] = json_decode(base64UrlDecode($tokenParts[0]), true);
+    $decodedToken['payload'] = json_decode(base64UrlDecode($tokenParts[1]), true);
+    $decodedToken['signatureProvided'] = base64UrlDecode($tokenParts[2]);
+
+    // validate the token
     if ($methodName == 'charge') {
-        return authenticateRemotely($token);
+        return authenticateRemotely($decodedToken);
     } else {
-        return authenticateLocally($token);
+        return authenticateLocally($decodedToken, $tokenParts);
     }
 }
 
-function authenticateRemotely($token)
+function authenticateRemotely($decodedToken)
 {
-    echo "remote";
+    var_dump($decodedToken);
     return false;
 }
 
-function authenticateLocally()
+function authenticateLocally($decodedToken, $tokenParts)
 {
-    echo "local";
-    return false;
+    // first, check the items that can be verified without the Web keys:
+
+    // 1. expiration time
+    $tokenExpirationTime = $decodedToken['payload']['exp'];
+    $now = time();
+
+    if ($tokenExpirationTime < $now) {
+        return false;
+    }
+
+    // 2. Issuer
+    $tokenIssuer = $decodedToken['payload']['iss'];
+
+    if ($tokenIssuer != getenv('OKTA_ISSUER')) {
+        return false;
+    }
+
+    // 3. Audience
+    $tokenAudience = $decodedToken['payload']['aud'];
+
+    if ($tokenAudience != getenv('OKTA_AUDIENCE')) {
+        return false;
+    }
+
+    // 4. Client ID
+    $tokenClientId = $decodedToken['payload']['cid'];
+
+    if ($tokenClientId != getenv('OKTA_CLIENT_ID')) {
+        return false;
+    }
+
+    // Then, get the JSON Web Keys
+    // (they should be cached to avoid
+    // calls to Okta on each API request)...
+    $metadataUrl = getenv('OKTA_ISSUER') . '/.well-known/oauth-authorization-server';
+    $metadata = http($metadataUrl);
+    $jwksUri = $metadata['jwks_uri'];
+    $keys = http($jwksUri)['keys'][0];
+
+    // ...and verify the parts that need the keys:
+
+    // 5. Key ID ('kid' claim)
+    $tokenKid = $decodedToken['header']['kid'];
+
+    if ($tokenKid != $keys['kid']) {
+        return false;
+    }
+
+    // 6. Signing algorithm
+    $tokenAlgorithm = $decodedToken['header']['alg'];
+
+    if ($tokenAlgorithm != $keys['alg']) {
+        return false;
+    }
+
+    // 7. Signature verification
+    $header = $tokenParts[0];
+    $payload = $tokenParts[1];
+    $message = $header . '.' . $payload;
+    $tokenSignature = $decodedToken['signatureProvided'];
+    $publicKey = createPemFromModulusAndExponent($keys['n'], $keys['e']);
+
+    // hardcoded to OpenSSL:SHA256 which correspondes to 'RS256'
+    // might need to change to hash_hmac depending on $keys['alg']
+    $result = openssl_verify($message, $tokenSignature, $publicKey, OPENSSL_ALGO_SHA256);
+
+    if (! $result) {
+        return false;
+    }
+
+    return true;
+}
+
+function http($url, $params = null)
+{
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    if ($params) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($params));
+    }
+    return json_decode(curl_exec($ch), true);
+}
+
+function createPemFromModulusAndExponent($n, $e)
+{
+    $modulus = base64UrlDecode($n);
+    $publicExponent = base64UrlDecode($e);
+
+    $components = [
+        'modulus' => pack('Ca*a*', 2, encodeLength(strlen($modulus)), $modulus),
+        'publicExponent' => pack('Ca*a*', 2, encodeLength(strlen($publicExponent)), $publicExponent)
+    ];
+
+    $RSAPublicKey = pack(
+        'Ca*a*a*',
+        48,
+        encodeLength(strlen($components['modulus']) + strlen($components['publicExponent'])),
+        $components['modulus'],
+        $components['publicExponent']
+    );
+
+    // hex version of MA0GCSqGSIb3DQEBAQUA
+    $rsaOID = pack('H*', '300d06092a864886f70d0101010500');
+    $RSAPublicKey = chr(0) . $RSAPublicKey;
+    $RSAPublicKey = chr(3) . encodeLength(strlen($RSAPublicKey)) . $RSAPublicKey;
+    $RSAPublicKey = pack(
+        'Ca*a*',
+        48,
+        encodeLength(strlen($rsaOID . $RSAPublicKey)),
+        $rsaOID . $RSAPublicKey
+    );
+
+    $RSAPublicKey = "-----BEGIN PUBLIC KEY-----\r\n" .
+            chunk_split(base64_encode($RSAPublicKey), 64) .
+            '-----END PUBLIC KEY-----';
+
+    return $RSAPublicKey;
+}
+
+function base64UrlDecode($input)
+{
+    $remainder = strlen($input) % 4;
+    if ($remainder) {
+        $padlen = 4 - $remainder;
+        $input .= str_repeat('=', $padlen);
+    }
+    return base64_decode(strtr($input, '-_', '+/'));
+}
+
+function encodeLength($length)
+{
+    if ($length <= 0x7F) {
+        return chr($length);
+    }
+    $temp = ltrim(pack('N', $length), chr(0));
+    return pack('Ca*', 0x80 | strlen($temp), $temp);
+}
+
+function base64UrlEncode($text)
+{
+    return str_replace(
+        ['+', '/', '='],
+        ['-', '_', ''],
+        base64_encode($text)
+    );
 }
