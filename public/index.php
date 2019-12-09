@@ -100,8 +100,8 @@ function authenticateRemotely($token)
 
     $params = [
         'token' => $token,
-        'client_id' => getenv('OKTA_CLIENT_ID'),
-        'client_secret' => getenv('OKTA_CLIENT_SECRET')
+        'client_id' => getenv('OKTA_SERVICE_APP_ID'),
+        'client_secret' => getenv('OKTA_SERVICE_APP_SECRET')
     ];
 
     $result = http($introspectionUrl, $params);
