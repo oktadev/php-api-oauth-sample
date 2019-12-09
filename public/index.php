@@ -86,16 +86,31 @@ function authenticate($methodName)
 
     // validate the token
     if ($methodName == 'charge') {
-        return authenticateRemotely($decodedToken);
+        return authenticateRemotely($token);
     } else {
         return authenticateLocally($decodedToken, $tokenParts);
     }
 }
 
-function authenticateRemotely($decodedToken)
+function authenticateRemotely($token)
 {
-    var_dump($decodedToken);
-    return false;
+    $metadataUrl = getenv('OKTA_ISSUER') . '/.well-known/oauth-authorization-server';
+    $metadata = http($metadataUrl);
+    $introspectionUrl = $metadata['introspection_endpoint'];
+
+    $params = [
+        'token' => $token,
+        'client_id' => getenv('OKTA_CLIENT_ID'),
+        'client_secret' => getenv('OKTA_CLIENT_SECRET')
+    ];
+
+    $result = http($introspectionUrl, $params);
+
+    if (! $result['active']) {
+        return false;
+    }
+
+    return true;
 }
 
 function authenticateLocally($decodedToken, $tokenParts)
