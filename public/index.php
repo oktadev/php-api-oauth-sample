@@ -1,7 +1,9 @@
 <?php
-require "../bootstrap.php";
+require __DIR__."/../bootstrap.php";
 
 use Src\Controllers\CustomerController;
+use \Firebase\JWT\JWT;
+use \Firebase\JWT\JWK;
 
 // send some CORS headers so the API can be called from anywhere
 header("Access-Control-Allow-Origin: *");
@@ -78,17 +80,11 @@ function authenticate($methodName)
 
     $token = $matches[1];
 
-    // decode the token
-    $tokenParts = explode('.', $token);
-    $decodedToken['header'] = json_decode(base64UrlDecode($tokenParts[0]), true);
-    $decodedToken['payload'] = json_decode(base64UrlDecode($tokenParts[1]), true);
-    $decodedToken['signatureProvided'] = base64UrlDecode($tokenParts[2]);
-
     // validate the token
     if ($methodName == 'charge') {
         return authenticateRemotely($token);
     } else {
-        return authenticateLocally($decodedToken, $tokenParts);
+        return authenticateLocally($token, $tokenParts);
     }
 }
 
@@ -113,75 +109,64 @@ function authenticateRemotely($token)
     return true;
 }
 
-function authenticateLocally($decodedToken, $tokenParts)
+function authenticateLocally($token, $tokenParts)
 {
-    // first, check the items that can be verified without the Web keys:
+    $tokenParts = explode('.', $token);
+    $decodedToken['header'] = json_decode(base64UrlDecode($tokenParts[0]), true);
+    $decodedToken['payload'] = json_decode(base64UrlDecode($tokenParts[1]), true);
+    $decodedToken['signatureProvided'] = base64UrlDecode($tokenParts[2]);
 
-    // 1. expiration time
-    $tokenExpirationTime = $decodedToken['payload']['exp'];
-    $now = time();
-
-    if ($tokenExpirationTime < $now) {
-        return false;
-    }
-
-    // 2. Issuer
-    $tokenIssuer = $decodedToken['payload']['iss'];
-
-    if ($tokenIssuer != getenv('OKTA_ISSUER')) {
-        return false;
-    }
-
-    // 3. Audience
-    $tokenAudience = $decodedToken['payload']['aud'];
-
-    if ($tokenAudience != getenv('OKTA_AUDIENCE')) {
-        return false;
-    }
-
-    // 4. Client ID
-    $tokenClientId = $decodedToken['payload']['cid'];
-
-    if ($tokenClientId != getenv('OKTA_CLIENT_ID')) {
-        return false;
-    }
-
-    // Then, get the JSON Web Keys
-    // (they should be cached to avoid
+    // Get the JSON Web Keys from the server that signed the token
+    // (ideally they should be cached to avoid
     // calls to Okta on each API request)...
     $metadataUrl = getenv('OKTA_ISSUER') . '/.well-known/oauth-authorization-server';
     $metadata = http($metadataUrl);
     $jwksUri = $metadata['jwks_uri'];
-    $keys = http($jwksUri)['keys'][0];
+    $keys = http($jwksUri);
 
-    // ...and verify the parts that need the keys:
-
-    // 5. Key ID ('kid' claim)
-    $tokenKid = $decodedToken['header']['kid'];
-
-    if ($tokenKid != $keys['kid']) {
+    // Find the public key matching the kid from the input token
+    $publicKey = false;
+    foreach($keys['keys'] as $key) {
+        if($key['kid'] == $decodedToken['header']['kid']) {
+            $publicKey = JWK::parseKey($key);
+            break;
+        }
+    }    
+    if (!$publicKey) {
+        echo "Couldn't find public key\n";
         return false;
     }
 
-    // 6. Signing algorithm
-    $tokenAlgorithm = $decodedToken['header']['alg'];
-
-    if ($tokenAlgorithm != $keys['alg']) {
+    // Check the signing algorithm
+    if ($decodedToken['header']['alg'] != 'RS256') {
+        echo "Bad algorithm\n";
         return false;
     }
 
-    // 7. Signature verification
-    $header = $tokenParts[0];
-    $payload = $tokenParts[1];
-    $message = $header . '.' . $payload;
-    $tokenSignature = $decodedToken['signatureProvided'];
-    $publicKey = createPemFromModulusAndExponent($keys['n'], $keys['e']);
-
-    // hardcoded to OpenSSL:SHA256 which correspondes to 'RS256'
-    // might need to change to hash_hmac depending on $keys['alg']
-    $result = openssl_verify($message, $tokenSignature, $publicKey, OPENSSL_ALGO_SHA256);
+    $result = JWT::decode($token, $publicKey, array('RS256'));
 
     if (! $result) {
+        echo "Error decoding JWT\n";
+        return false;
+    }
+
+    // Basic JWT validation passed, now check the claims
+
+    // Verify the Issuer matches Okta's issuer
+    if ($decodedToken['payload']['iss'] != getenv('OKTA_ISSUER')) {
+        echo "Issuer did not match\n";
+        return false;
+    }
+
+    // Verify the audience matches the expected audience for this API
+    if ($decodedToken['payload']['aud'] != getenv('OKTA_AUDIENCE')) {
+        echo "Audience did not match\n";
+        return false;
+    }
+
+    // Verify this token was issued to the expected client_id
+    if ($decodedToken['payload']['cid'] != getenv('OKTA_CLIENT_ID')) {
+        echo "Client ID did not match\n";
         return false;
     }
 
@@ -196,42 +181,6 @@ function http($url, $params = null)
         curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($params));
     }
     return json_decode(curl_exec($ch), true);
-}
-
-function createPemFromModulusAndExponent($n, $e)
-{
-    $modulus = base64UrlDecode($n);
-    $publicExponent = base64UrlDecode($e);
-
-    $components = [
-        'modulus' => pack('Ca*a*', 2, encodeLength(strlen($modulus)), $modulus),
-        'publicExponent' => pack('Ca*a*', 2, encodeLength(strlen($publicExponent)), $publicExponent)
-    ];
-
-    $RSAPublicKey = pack(
-        'Ca*a*a*',
-        48,
-        encodeLength(strlen($components['modulus']) + strlen($components['publicExponent'])),
-        $components['modulus'],
-        $components['publicExponent']
-    );
-
-    // hex version of MA0GCSqGSIb3DQEBAQUA
-    $rsaOID = pack('H*', '300d06092a864886f70d0101010500');
-    $RSAPublicKey = chr(0) . $RSAPublicKey;
-    $RSAPublicKey = chr(3) . encodeLength(strlen($RSAPublicKey)) . $RSAPublicKey;
-    $RSAPublicKey = pack(
-        'Ca*a*',
-        48,
-        encodeLength(strlen($rsaOID . $RSAPublicKey)),
-        $rsaOID . $RSAPublicKey
-    );
-
-    $RSAPublicKey = "-----BEGIN PUBLIC KEY-----\r\n" .
-            chunk_split(base64_encode($RSAPublicKey), 64) .
-            '-----END PUBLIC KEY-----';
-
-    return $RSAPublicKey;
 }
 
 function base64UrlDecode($input)

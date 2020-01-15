@@ -1,5 +1,5 @@
 <?php
-require "bootstrap.php";
+require __DIR__."/../bootstrap.php";
 
 $clientId     = getenv('OKTA_CLIENT_ID');
 $clientSecret = getenv('OKTA_CLIENT_SECRET');
@@ -10,6 +10,8 @@ $issuer       = getenv('OKTA_ISSUER');
 $token = obtainToken($issuer, $clientId, $clientSecret, $scope);
 
 echo $token;
+echo "\n";
+
 
 function obtainToken($issuer, $clientId, $clientSecret, $scope)
 {
